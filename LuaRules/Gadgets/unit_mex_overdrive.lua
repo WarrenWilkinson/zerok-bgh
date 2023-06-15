@@ -1,0 +1,1932 @@
+-- $Id: unit_mex_overdrive.lua 4550 2009-05-05 18:07:29Z licho $
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+if not (gadgetHandler:IsSyncedCode()) then
+	return
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+function gadget:GetInfo()
+	return {
+		name      = "Mex Control with energy link",
+		desc      = "Controls mex overload and energy link grid",
+		author    = "Licho, Google Frog (pylon conversion), ashdnazg (quadField)",
+		date      = "16.5.2008 (OD date)",
+		license   = "GNU GPL, v2 or later",
+		layer     = -4,   -- OD grid circles must be drawn before lava drawing gadget some maps have (which has layer = -3). Must be after Priority
+		enabled   = true  --  loaded by default?
+	}
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+local sqrt  = math.sqrt
+local min   = math.min
+local max   = math.max
+
+local spValidUnitID       = Spring.ValidUnitID
+local spGetUnitDefID      = Spring.GetUnitDefID
+local spGetUnitAllyTeam   = Spring.GetUnitAllyTeam
+local spGetUnitTeam       = Spring.GetUnitTeam
+local spGetUnitPosition   = Spring.GetUnitPosition
+local spGetUnitIsStunned  = Spring.GetUnitIsStunned
+local spGetUnitRulesParam = Spring.GetUnitRulesParam
+local spSetUnitRulesParam = Spring.SetUnitRulesParam
+local spSetTeamRulesParam = Spring.SetTeamRulesParam
+
+local spGetTeamResources  = Spring.GetTeamResources
+local spAddTeamResource   = Spring.AddTeamResource
+local spUseTeamResource   = Spring.UseTeamResource
+local spSetTeamResource   = Spring.SetTeamResource
+local spGetTeamInfo       = Spring.GetTeamInfo
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+local FREE_STORAGE_LIMIT = 300
+local MIN_STORAGE = 0.5
+local PAYBACK_FACTOR = 0.6
+local MEX_REFUND_SHARE = 0.8 -- refund starts at 80% of base income and linearly goes to 20% as full payback approaches
+local MEX_REFUND_MIN = 0.2
+
+--[[ Uses the regular 50% payback. This is because at 100% people would leave
+     empty nanoframes for their allies to finish (actual experience from past).
+     In general, the "correct" value is such that the people who are aware of
+     the mechanic don't feel the need to abuse it in a lobsterpot to get ahead.
+     Ideally the refund would just be for whomever actually put in resources,
+     but that would involve the build step callin which is quite expensive. ]]
+local MEX_REFUND_VALUE = PAYBACK_FACTOR * UnitDefNames.staticmex.metalCost
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+local mexDefs = {}
+--local energyDefs = {}
+local pylonDefs = {}
+local generatorDefs = {}
+local paybackDefs = {} -- how much to pay back
+local allowBuildStepDef = {} -- cache basically?
+
+local isReturnOfInvestment = (Spring.GetModOptions().overdrivesharingscheme ~= "0")
+
+local enableEnergyPayback = isReturnOfInvestment
+local enableMexPayback = isReturnOfInvestment
+
+include("LuaRules/Configs/constants.lua")
+
+--[[ Set to be twice the largest link range except Pylon, so a regular linking building can be in 4 quads at most.
+     Pylons can belong to more quads but they are comparatively rare and would inflate this value too much.
+     A potential optimisation here would be to measure if limiting this value to Solar radius would help even further
+     since Solar/Wind/Mex make up the majority of linkables. ]]
+local QUADFIELD_SQUARE_SIZE = 300
+
+for i = 1, #UnitDefs do
+	local udef = UnitDefs[i]
+	if (udef.customParams.ismex) then
+		mexDefs[i] = true
+		allowBuildStepDef[i] = true
+	end
+	local pylonRange = tonumber(udef.customParams.pylonrange) or 0
+	if pylonRange > 0 then
+		pylonDefs[i] = {
+			range = pylonRange,
+			neededLink = tonumber(udef.customParams.neededlink) or false,
+			keeptooltip = udef.customParams.keeptooltip or false,
+		}
+	end
+	local metalIncome = tonumber(udef.customParams.income_metal) or 0
+	local energyIncome = tonumber(udef.customParams.income_energy) or 0
+	local isWind = (udef.customParams.windgen and true) or false
+	if metalIncome > 0 or energyIncome > 0 or isWind then
+		generatorDefs[i] = {
+			metalIncome = metalIncome,
+			energyIncome = energyIncome,
+			sharedEnergyGenerator = udef.customParams.shared_energy_gen and true
+		}
+		if energyIncome > 0 or isWind then
+			paybackDefs[i] = (udef.customParams.overdrive_payback and tonumber(udef.customParams.overdrive_payback)) or (udef.metalCost * PAYBACK_FACTOR)
+			allowBuildStepDef[i] = true
+		end
+	end
+end
+
+local alliedTrueTable = {allied = true}
+local inlosTrueTable = {inlos = true}
+
+local sentErrorWarning = false
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+
+local function paybackFactorFunction(repayRatio)
+	-- Must map [0,1) to (0,1]
+	-- Must not have any sequences on the domain that converge to 0 in the codomain.
+	local repay =  0.35 - repayRatio*0.25
+	if repay > 0.35 then
+		return 0.35
+	else
+		return repay
+	end
+end
+
+local spammedError = false
+local debugGridMode = false
+local debugAllyTeam = false
+local waiveGridLowPower = false
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+local mexes = {}   -- mexes[teamID][gridID][unitID] == mexMetal
+local mexByID = {} -- mexByID[unitID] = {gridID, allyTeamID, refundTeams, refundTotal, refundSoFar}
+
+local pylon = {} -- pylon[allyTeamID][unitID] = {gridID,mexes,mex[unitID],x,z,overdrive, attachedPylons = {[1] = size, [2] =  unitID, ...}}
+local pylonList = {} -- pylon[allyTeamID] = {data = {[1] = unitID, [2] = unitID, ...}, count = number}
+
+local generator = {} -- generator[allyTeamID][teamID][unitID] = {generatorListID, metalIncome, energyIncome}
+local generatorList = {} -- generator[allyTeamID][teamID] = {data  = {[1] = unitID, [2] = unitID, ...}, count = number}
+local resourceGeneratingUnit = {}
+
+local unitAlreadyFinished = {} -- To prevent payback being added twice, even across allyTeam transfers.
+local buildPropTracker = {} -- Track which teams have spent resources on this unit.
+
+local pylonGridQueue = false -- pylonGridQueue[unitID] = true
+
+local unitPaybackTeamIDs = {} -- indexed by unitID, tells unit which teams gets it's payback.
+local teamPayback = {} -- teamPayback[teamID] = {count = 0, toRemove = {}, data = {[1] = {unitID = unitID, cost = costOfUnit, repaid = howMuchHasBeenRepaid}}}
+
+local allyTeamInfo = {}
+
+local quadFields = {} -- quadFields[allyTeamID] = quadField object (see Utilities/quadField.lua)
+
+do
+	local allyTeamList = Spring.GetAllyTeamList()
+	for i = 1, #allyTeamList do
+		local allyTeamID = allyTeamList[i]
+		pylon[allyTeamID] = {}
+		pylonList[allyTeamID] = {data = {}, count = 0}
+		generator[allyTeamID] = {}
+		generatorList[allyTeamID] = {}
+		mexes[allyTeamID] = {}
+		mexes[allyTeamID][0] = {}
+		quadFields[allyTeamID] = Spring.Utilities.QuadField(QUADFIELD_SQUARE_SIZE)
+
+		allyTeamInfo[allyTeamID] = {
+			grids = 0,
+			grid = {}, -- pylon[unitID]
+			nilGrid = {},
+			team = {},
+			teams = 0,
+			innateMetal = Spring.GetGameRulesParam("OD_allyteam_metal_innate_" .. allyTeamID) or 0,
+			innateEnergy = Spring.GetGameRulesParam("OD_allyteam_energy_innate_" .. allyTeamID) or 0,
+		}
+
+		local teamList = Spring.GetTeamList(allyTeamID)
+		for j = 1, #teamList do
+			local teamID = teamList[j]
+			allyTeamInfo[allyTeamID].teams = allyTeamInfo[allyTeamID].teams + 1
+			allyTeamInfo[allyTeamID].team[allyTeamInfo[allyTeamID].teams] = teamID
+
+			generator[allyTeamID][teamID] = {}
+			generatorList[allyTeamID][teamID] = {data = {}, count = 0}
+		end
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- Awards
+
+GG.Overdrive_allyTeamResources = {}
+local lastAllyTeamResources = {} -- 1 second lag for resource updates
+
+local function sendAllyTeamInformationToAwards(allyTeamID, summedBaseMetal, summedOverdrive, allyTeamEnergyIncome, ODenergy, wasteEnergy)
+	local last = lastAllyTeamResources[allyTeamID] or {}
+	GG.Overdrive_allyTeamResources[allyTeamID] = {
+		baseMetal = summedBaseMetal,
+		overdriveMetal = last.overdriveMetal or 0,
+		baseEnergy = allyTeamEnergyIncome,
+		overdriveEnergy = last.overdriveEnergy or 0,
+		wasteEnergy = last.wasteEnergy or 0,
+	}
+	lastAllyTeamResources[allyTeamID] = {
+		overdriveMetal = summedOverdrive,
+		overdriveEnergy = ODenergy,
+		wasteEnergy = wasteEnergy,
+	}
+end
+
+GG.Overdrive_teamResources = {}
+local lastTeamResources = {} -- 1 second lag for resource updates
+
+local function sendTeamInformationToAwards(teamID, baseMetal, overdriveMetal, overdriveEnergyChange)
+	local last = lastTeamResources[teamID] or {}
+	GG.Overdrive_teamResources[teamID] = {
+		baseMetal = baseMetal,
+		overdriveMetal = last.overdriveMetal or 0,
+		overdriveEnergyChange = last.overdriveEnergyChange or 0,
+	}
+	lastTeamResources[teamID] = {
+		overdriveMetal = overdriveMetal,
+		overdriveEnergyChange = overdriveEnergyChange,
+	}
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- local functions
+
+local function energyToExtraM(energy)
+	-- return sqrt(energy)*0.25
+	return energy*0.25
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- Information Sharing to Widget functions
+
+local privateTable = {private = true}
+local previousData = {}
+
+local function SetTeamEconomyRulesParams(
+			teamID, resourceShares, -- TeamID of the team as well as number of active allies.
+
+			summedBaseMetal, -- AllyTeam base metal extrator income
+			summedOverdrive, -- AllyTeam overdrive income
+			allyTeamMiscMetalIncome, -- AllyTeam constructor income
+
+			allyTeamEnergyIncome, -- AllyTeam total energy generator income
+			allyTeamEnergyMisc, -- Team share innate and constructor energyIncome
+			overdriveEnergySpending, -- AllyTeam energy spent on overdrive
+			energyWasted, -- AllyTeam energy excess
+
+			baseShare, -- Team share of base metal extractor income
+			odShare, -- Team share of overdrive income
+			miscShare, -- Team share of constructor metal income
+
+			energyIncome, -- Total energy generator income
+			energyMisc, -- Team share innate and constructor energyIncome
+			overdriveEnergyNet, -- Amount of energy spent or recieved due to overdrive and income
+			overdriveEnergyChange) -- real change in energy due to overdrive
+
+	if previousData[teamID] then
+		local pd = previousData[teamID]
+		spSetTeamRulesParam(teamID, "OD_allies",               pd.resourceShares, privateTable)
+
+		spSetTeamRulesParam(teamID, "OD_team_metalBase",       pd.summedBaseMetal, privateTable)
+		spSetTeamRulesParam(teamID, "OD_team_metalOverdrive",  pd.summedOverdrive, privateTable)
+		spSetTeamRulesParam(teamID, "OD_team_metalMisc",       pd.allyTeamMiscMetalIncome, privateTable)
+
+		spSetTeamRulesParam(teamID, "OD_team_energyIncome",    pd.allyTeamEnergyIncome, privateTable)
+		spSetTeamRulesParam(teamID, "OD_team_energyMisc",      pd.allyTeamEnergyMisc, privateTable)
+		spSetTeamRulesParam(teamID, "OD_team_energyOverdrive", pd.overdriveEnergySpending, privateTable)
+		spSetTeamRulesParam(teamID, "OD_team_energyWaste",     pd.energyWasted, privateTable)
+
+		spSetTeamRulesParam(teamID, "OD_metalBase",       pd.baseShare, privateTable)
+		spSetTeamRulesParam(teamID, "OD_metalOverdrive",  pd.odShare, privateTable)
+		spSetTeamRulesParam(teamID, "OD_metalMisc",       pd.miscShare, privateTable)
+
+		spSetTeamRulesParam(teamID, "OD_energyIncome",    pd.energyIncome, privateTable)
+		spSetTeamRulesParam(teamID, "OD_energyMisc",      pd.energyMisc, privateTable)
+		spSetTeamRulesParam(teamID, "OD_energyOverdrive", pd.overdriveEnergyNet, privateTable)
+		spSetTeamRulesParam(teamID, "OD_energyChange",    pd.overdriveEnergyChange, privateTable)
+
+		spSetTeamRulesParam(teamID, "OD_RoI_metalDue",    teamPayback[teamID].metalDueOD, privateTable)
+		spSetTeamRulesParam(teamID, "OD_base_metalDue",   teamPayback[teamID].metalDueBase, privateTable)
+	else
+		previousData[teamID] = {}
+	end
+
+	local pd = previousData[teamID]
+
+	pd.resourceShares = resourceShares
+
+	pd.summedBaseMetal = summedBaseMetal
+	pd.summedOverdrive = summedOverdrive
+	pd.allyTeamMiscMetalIncome = allyTeamMiscMetalIncome
+
+	pd.allyTeamEnergyIncome = allyTeamEnergyIncome
+	pd.allyTeamEnergyMisc = allyTeamEnergyMisc
+	pd.overdriveEnergySpending = overdriveEnergySpending
+	pd.energyWasted = energyWasted
+
+	pd.baseShare = baseShare
+	pd.odShare = odShare
+	pd.miscShare = miscShare
+
+	pd.energyIncome = energyIncome
+	pd.energyMisc = energyMisc
+	pd.overdriveEnergyNet = overdriveEnergyNet
+	pd.overdriveEnergyChange = overdriveEnergyChange
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- PYLONS
+
+local function AddPylonToGrid(unitID)
+	local allyTeamID = spGetUnitAllyTeam(unitID)
+	local pX,_,pZ = spGetUnitPosition(unitID)
+	local ai = allyTeamInfo[allyTeamID]
+
+	if debugGridMode then
+		Spring.Echo("AddPylonToGrid " .. unitID)
+	end
+
+	local newGridID = 0
+	local attachedGrids = 0
+	local attachedGrid = {}
+	local attachedGridID = {}
+
+	--check for nearby pylons
+	local ownRange = pylon[allyTeamID][unitID].linkRange
+
+	local attachedPylons = pylon[allyTeamID][unitID].attachedPylons
+
+	for i = 2, attachedPylons[1] do
+		local pid = attachedPylons[i]
+		local pylonData = pylon[allyTeamID][pid]
+		if pylonData then
+			if pid ~= unitID and pylonData.gridID ~= 0 and pylonData.active then
+				if not attachedGridID[pylonData.gridID] then
+					attachedGrids = attachedGrids + 1
+
+					attachedGrid[attachedGrids] = pylonData.gridID
+					attachedGridID[pylonData.gridID] = true
+				end
+			end
+		elseif not spammedError then
+			Spring.Echo("Pylon problem detected in AddPylonToGrid.")
+		end
+	end
+
+	if attachedGrids == 0 then -- create a new grid
+		local foundSpot = false
+		for i = 1, ai.grids  do
+			if ai.nilGrid[i] then
+				ai.grid[i] = {
+					pylon = {},
+				}
+				newGridID = i
+				ai.nilGrid[i] = false
+				foundSpot = true
+				break
+			end
+		end
+		if not foundSpot then
+			ai.grids = ai.grids + 1
+			newGridID = ai.grids
+			ai.grid[ai.grids] = {
+				pylon = {},
+			}
+			mexes[allyTeamID][newGridID] = {}
+		end
+
+	else -- add to an existing grid
+		newGridID = attachedGrid[1]
+		for i = 2, attachedGrids do -- merge grids if it attaches to 2 or more
+			local oldGridID = attachedGrid[i]
+			for pid,_ in pairs(ai.grid[oldGridID].pylon) do
+				local pylonData = pylon[allyTeamID][pid]
+				pylonData.gridID = newGridID
+				--NOTE: since mex became a pylon it no longer store list of mex, now only store itself as mex
+				if pylonData.mex then
+					local mid = pid
+					mexes[allyTeamID][newGridID][mid] = mexes[allyTeamID][oldGridID][mid]
+					mexByID[mid].gridID = newGridID
+					mexes[allyTeamID][oldGridID][mid] = nil
+				end
+				ai.grid[newGridID].pylon[pid] = true
+				spSetUnitRulesParam(pid,"gridNumber",newGridID,alliedTrueTable)
+			end
+			ai.nilGrid[oldGridID] = true
+		end
+	end
+
+	ai.grid[newGridID].pylon[unitID] = true
+	pylon[allyTeamID][unitID].gridID = newGridID
+	spSetUnitRulesParam(unitID,"gridNumber",newGridID,alliedTrueTable)
+
+	-- add econ to new grid
+	-- mexes
+	if pylon[allyTeamID][unitID].mex and mexes[allyTeamID][0][unitID] then
+		local mid = unitID
+		local orgMetal = mexes[allyTeamID][0][mid]
+
+		mexes[allyTeamID][newGridID][mid] = orgMetal
+		mexByID[mid].gridID = newGridID
+		mexes[allyTeamID][0][mid] = nil
+	end
+end
+
+local function QueueAddPylonToGrid(unitID)
+	if debugGridMode then
+		Spring.Echo("QueueAddPylonToGrid " .. unitID)
+	end
+	if not pylonGridQueue then
+		pylonGridQueue = {}
+	end
+	pylonGridQueue[unitID] = true
+end
+
+local function RemovePylonsFromGridQueue(unitID)
+	if debugGridMode then
+		Spring.Echo("RemovePylonsFromGridQueue " .. unitID)
+	end
+	if pylonGridQueue then
+		pylonGridQueue[unitID] = nil
+	end
+end
+
+local function AddPylon(unitID, unitDefID, range)
+	local allyTeamID = spGetUnitAllyTeam(unitID)
+	local pX,_,pZ = spGetUnitPosition(unitID)
+	local ai = allyTeamInfo[allyTeamID]
+
+	if pylon[allyTeamID][unitID] then
+		return
+	end
+	quadFields[allyTeamID]:Insert(unitID, pX, pZ, range)
+	local intersections = quadFields[allyTeamID]:GetIntersections(unitID)
+	local neededLink = pylonDefs[unitDefID].neededLink
+
+	pylon[allyTeamID][unitID] = {
+		gridID = 0,
+		--mexes = 0,
+		mex = (mexByID[unitID] and true) or false,
+		attachedPylons = intersections,
+		linkRange = range,
+		mexRange = 10,
+		--nearEnergy = {},
+		x = pX,
+		z = pZ,
+		neededLink = neededLink,
+		active = true,
+		color = 0,
+	}
+	if neededLink and not waiveGridLowPower then
+		-- Start spawned units with low power until the next grid update
+		spSetUnitRulesParam(unitID, "lowpower", 1, inlosTrueTable)
+	end
+
+	for i = 2, intersections[1] do
+		local pid = intersections[i]
+		local pylonData = pylon[allyTeamID][pid]
+		if pylonData then
+			local attachedPylons = pylonData.attachedPylons
+			attachedPylons[1] = attachedPylons[1] + 1
+			attachedPylons[attachedPylons[1]] = unitID
+		elseif not spammedError then
+			Spring.Echo("Pylon problem detected in AddPylonToGrid.")
+		end
+	end
+
+	local list = pylonList[allyTeamID]
+	list.count = list.count + 1
+	list.data[list.count] = unitID
+
+	pylon[allyTeamID][unitID].listID = list.count
+
+	if debugGridMode then
+		Spring.Echo("AddPylon " .. unitID)
+		Spring.Utilities.UnitEcho(unitID, list.count .. ", " .. unitID)
+	end
+
+	QueueAddPylonToGrid(unitID)
+end
+
+local function DestroyGrid(allyTeamID,oldGridID)
+	local ai = allyTeamInfo[allyTeamID]
+
+	if debugGridMode then
+		Spring.Echo("DestroyGrid " .. oldGridID)
+	end
+
+	for pid,_ in pairs(ai.grid[oldGridID].pylon) do
+		pylon[allyTeamID][pid].gridID = 0
+
+		if (pylon[allyTeamID][pid].mex) then
+			local mid = pid
+			local orgMetal = mexes[allyTeamID][oldGridID][mid]
+			mexes[allyTeamID][oldGridID][mid] = nil
+			mexes[allyTeamID][0][mid] = orgMetal
+			mexByID[mid].gridID = 0
+		end
+	end
+
+	ai.nilGrid[oldGridID] = true
+end
+
+local function ReactivatePylon(unitID)
+	local allyTeamID = spGetUnitAllyTeam(unitID)
+	local ai = allyTeamInfo[allyTeamID]
+
+	if debugGridMode then
+		Spring.Echo("ReactivatePylon " .. unitID)
+	end
+	pylon[allyTeamID][unitID].active = true
+
+	QueueAddPylonToGrid(unitID)
+end
+
+local function DeactivatePylon(unitID)
+	local allyTeamID = spGetUnitAllyTeam(unitID)
+	local ai = allyTeamInfo[allyTeamID]
+
+	if debugGridMode then
+		Spring.Echo("DeactivatePylon " .. unitID)
+	end
+
+	RemovePylonsFromGridQueue(unitID)
+
+	local oldGridID = pylon[allyTeamID][unitID].gridID
+	if oldGridID ~= 0 then
+		local pylonMap = ai.grid[oldGridID].pylon
+		local energyList = pylon[allyTeamID][unitID].nearEnergy
+
+		DestroyGrid(allyTeamID,oldGridID)
+
+		for pid,_ in pairs(pylonMap) do
+			if (pid ~= unitID) then
+				QueueAddPylonToGrid(pid)
+			end
+		end
+	end
+
+	pylon[allyTeamID][unitID].active = false
+end
+
+local function RemovePylon(unitID)
+	local allyTeamID = spGetUnitAllyTeam(unitID)
+
+	if debugGridMode then
+		Spring.Echo("RemovePylon start " .. unitID)
+		Spring.Utilities.TableEcho(pylonList[allyTeamID])
+		Spring.Utilities.TableEcho(pylon[allyTeamID])
+	end
+
+	RemovePylonsFromGridQueue(unitID)
+
+	if not pylon[allyTeamID][unitID] then
+		--Spring.Echo("RemovePylon not pylon[allyTeamID][unitID] " .. unitID)
+		return
+	end
+
+	local pX,_,pZ = spGetUnitPosition(unitID)
+	local ai = allyTeamInfo[allyTeamID]
+
+	local intersections = pylon[allyTeamID][unitID].attachedPylons
+
+	for i = 2, intersections[1] do
+		local pid = intersections[i]
+		local pylonData = pylon[allyTeamID][pid]
+		if pylonData then
+			local attachedPylons = pylonData.attachedPylons
+			for j = 2, attachedPylons[1] do
+				if attachedPylons[j] == unitID then
+					attachedPylons[j] = attachedPylons[attachedPylons[1]]
+					attachedPylons[1] = attachedPylons[1] - 1 -- no need to delete since we keep size
+					break
+				end
+			end
+		elseif not spammedError then
+			Spring.Echo("Pylon problem detected in AddPylonToGrid.")
+		end
+	end
+	quadFields[allyTeamID]:Remove(unitID)
+
+
+	local oldGridID = pylon[allyTeamID][unitID].gridID
+	local activeState = pylon[allyTeamID][unitID].active
+
+	local isMex = pylon[allyTeamID][unitID].mex
+
+	if activeState and oldGridID ~= 0 then
+		local pylonMap = ai.grid[oldGridID].pylon
+		local energyList = pylon[allyTeamID][unitID].nearEnergy
+
+		DestroyGrid(allyTeamID,oldGridID)
+
+		for pid,_ in pairs(pylonMap) do
+			if (pid ~= unitID) then
+				QueueAddPylonToGrid(pid)
+			end
+		end
+	end
+
+	local list = pylonList[allyTeamID]
+	local listID = pylon[allyTeamID][unitID].listID
+	list.data[listID] = list.data[list.count]
+	pylon[allyTeamID][list.data[listID]].listID = listID
+	list.data[list.count] = nil
+	list.count = list.count - 1
+	pylon[allyTeamID][unitID] = nil
+
+	-- mexes
+	if isMex then
+		local mid = unitID
+		local orgMetal = mexes[allyTeamID][0][mid]
+		mexes[allyTeamID][0][mid] = nil
+
+		local toRefund = mexByID[unitID].refundTeams
+		if toRefund then
+			for teamID, prop in pairs(toRefund) do
+				teamPayback[teamID].metalDueBase = teamPayback[teamID].metalDueBase - (mexByID[unitID].refundTotal - mexByID[unitID].refundSoFar) * prop
+			end
+		end
+		mexByID[unitID] = nil
+		local mexGridID = oldGridID --Note: mexGridID is oldGridID of this pylon because mex is this pylon
+		-- takenMexId[unitID] = false
+
+		mexes[allyTeamID][mexGridID][mid] = orgMetal
+		mexByID[unitID].gridID = mexGridID
+	end
+
+	if debugGridMode then
+		Spring.Echo("RemovePylon end " .. unitID)
+		Spring.Utilities.TableEcho(pylonList[allyTeamID])
+		Spring.Utilities.TableEcho(pylon[allyTeamID])
+	end
+
+end
+
+local function AddPylonsInQueueToGrid()
+	if pylonGridQueue then
+		for pid,_ in pairs(pylonGridQueue) do
+			AddPylonToGrid(pid)
+		end
+		pylonGridQueue =false
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- PAYBACK
+-- teamPayback[teamID] = {count = 0, toRemove = {}, data = {[1] = {unitID = unitID, cost = costOfUnit, repaid = howMuchHasBeenRepaid}}}
+
+local function GetUnitTeamBuildProp(unitID, teamID)
+	if not buildPropTracker[unitID] then
+		return {[teamID] = 1}
+	end
+	local total = 0
+	local teamList = {}
+	for propTeamID, amount in pairs(buildPropTracker[unitID]) do
+		if amount > 0 and Spring.AreTeamsAllied(teamID, propTeamID) then
+			total = total + amount
+			teamList[#teamList + 1] = propTeamID
+		end
+	end
+	if total <= 0 then
+		return {[teamID] = 1}
+	end
+	
+	local prop = {}
+	for i = 1, #teamList do
+		local propTeamID = teamList[i]
+		prop[propTeamID] = buildPropTracker[unitID][propTeamID] / total
+	end
+	return prop
+end
+
+local function AddEnergyToPayback(unitID, unitDefID, paybackTeams)
+	if unitPaybackTeamIDs[unitID] then
+		-- Only add units to payback once.
+		return
+	end
+	local paybackCost = paybackDefs[unitDefID]
+	unitPaybackTeamIDs[unitID] = paybackTeams
+	
+	for teamID, prop in pairs(paybackTeams) do
+		local teamData = teamPayback[teamID]
+		teamData.count = teamData.count + 1
+		teamData.data[teamData.count] = {
+			unitID = unitID,
+			cost = paybackCost * prop,
+			repaid = 0,
+		}
+		teamData.metalDueOD = teamData.metalDueOD + paybackCost * prop
+	end
+end
+
+local function RemoveEnergyToPayback(unitID, unitDefID)
+	local paybackTeams = unitPaybackTeamIDs[unitID]
+	if paybackTeams then -- many energy pieces will not have a payback when destroyed
+		for teamID, prop in pairs(paybackTeams) do
+			local teamData = teamPayback[teamID]
+			teamData.toRemove[unitID] = true
+		end
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- Mex Payback
+
+local function UpdateAndGetCurrentMexRefundShare(unitID, baseMetal)
+	if baseMetal <= 0 then
+		return false
+	end
+	local mexData = mexByID[unitID]
+	local refund = baseMetal*(MEX_REFUND_MIN + (MEX_REFUND_SHARE - MEX_REFUND_MIN) * (1 - mexData.refundSoFar / mexData.refundTotal))
+	if mexData.refundSoFar + refund >= mexData.refundTotal then
+		local remainder = mexData.refundTotal - mexData.refundSoFar
+		mexByID[unitID].refundTeams = nil
+		return remainder
+	end
+	mexData.refundSoFar = mexData.refundSoFar + refund
+	return refund
+end
+
+local function AddMexPayback(unitID, unitDefID, refundTeams, metalMake)
+	if (metalMake or 0) <= 0 then
+		return
+	end
+	if (not mexByID[unitID]) then
+		return
+	end
+	-- share goes down to 0 linearly, so halved to average it over refund duration
+	mexByID[unitID].refundTeams = refundTeams
+	mexByID[unitID].refundTotal = MEX_REFUND_VALUE
+	mexByID[unitID].refundSoFar = 0
+	for teamID, prop in pairs(refundTeams) do
+		teamPayback[teamID].metalDueBase = teamPayback[teamID].metalDueBase + mexByID[unitID].refundTotal * prop
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- Overdrive and resource handling
+
+local function OptimizeOverDrive(allyTeamID, allyTeamData, allyE, maxGridCapacity)
+	local summedMetalProduction = 0
+	local summedBaseMetal = 0
+	local summedOverdrive = 0
+
+	local maxedMetalProduction = 0
+	local maxedBaseMetal = 0
+	local maxedOverdrive = 0
+
+	local allyMetalSquared = 0
+	local allyTeamMexes = mexes[allyTeamID]
+
+	-- Calculate income squared sum each loop because mex income can change (eg handicap, slow damage)
+	local curMexIncomes = {}
+	local gridMexSquareSum = {}
+	for i = 1, allyTeamData.grids do -- loop through grids
+		gridMexSquareSum[i] = 0
+		for unitID, orgMetal in pairs(allyTeamMexes[i]) do -- loop mexes
+			local stunned_or_inbuld = spGetUnitIsStunned(unitID) or (spGetUnitRulesParam(unitID,"disarmed") == 1)
+			if stunned_or_inbuld then
+				orgMetal = 0
+			end
+			local incomeFactor = spGetUnitRulesParam(unitID, "resourceGenerationFactor") or 1
+			if incomeFactor then
+				orgMetal = orgMetal * incomeFactor
+			end
+			curMexIncomes[unitID] = orgMetal
+			allyMetalSquared = allyMetalSquared + orgMetal * orgMetal
+			gridMexSquareSum[i] = gridMexSquareSum[i] + orgMetal * orgMetal
+		end
+	end
+
+	local energyWasted = allyE
+	local gridEnergySpent = {}
+	local gridMetalGain = {}
+
+	local mexBaseMetal = {}
+	local privateBaseMetal = {}
+
+	local reCalc = true
+	local maxedGrid = {}
+	while reCalc do -- calculate overdrive for as long as a new grid is not maxed
+		reCalc = false
+		for i = 1, allyTeamData.grids do -- loop through grids
+			if not (maxedGrid[i] or allyTeamData.nilGrid[i]) then -- do not check maxed grids
+				gridEnergySpent[i] = 0
+				gridMetalGain[i] = 0
+				for unitID, _ in pairs(allyTeamMexes[i]) do -- loop mexes
+					local myMetalIncome = curMexIncomes[unitID]
+					local mexE = 0
+					if (allyMetalSquared > 0) then -- divide energy in ratio given by squared metal from mex
+						mexE = allyE * (myMetalIncome * myMetalIncome) / allyMetalSquared --the fraction of E to be consumed with respect to all other Mex
+						energyWasted = energyWasted - mexE -- leftover E minus Mex usage
+						gridEnergySpent[i] = gridEnergySpent[i] + mexE
+						-- if a grid is being too overdriven it has become maxed.
+						-- the grid's mexSqauredSum is used for best distribution
+						if gridEnergySpent[i] > maxGridCapacity[i] then --final Mex to be looped since we are out of E to OD the rest of the Mex
+							gridMetalGain[i] = 0
+							local gridE = maxGridCapacity[i]
+							local gridMetalSquared = gridMexSquareSum[i]
+							if gridMetalSquared <= 0 and not sentErrorWarning then
+								Spring.Echo("** Warning: gridMetalSquared <= 0 **")
+								Spring.Echo(gridMetalSquared)
+								sentErrorWarning = true
+							end
+
+							gridEnergySpent[i] = maxGridCapacity[i]
+
+							summedMetalProduction = 0
+							summedBaseMetal = 0
+							summedOverdrive = 0
+
+							maxedGrid[i] = true
+							reCalc = true
+							allyE = allyE - gridE
+							energyWasted = allyE
+							for unitID_inner, _ in pairs(allyTeamMexes[i]) do --re-distribute the grid energy to Mex (again! except taking account the limited energy of the grid)
+								myMetalIncome = curMexIncomes[unitID_inner]
+								mexE = gridE*(myMetalIncome * myMetalIncome) / gridMetalSquared
+								local metalMult = energyToExtraM(mexE)
+								local thisMexM = myMetalIncome + myMetalIncome * metalMult
+
+								spSetUnitRulesParam(unitID_inner, "overdrive", 1 + mexE / 5, inlosTrueTable)
+								spSetUnitRulesParam(unitID_inner, "overdrive_energyDrain", mexE, inlosTrueTable)
+								spSetUnitRulesParam(unitID_inner, "current_metalIncome", thisMexM, inlosTrueTable)
+								spSetUnitRulesParam(unitID_inner, "overdrive_proportion", metalMult, inlosTrueTable)
+
+								maxedMetalProduction = maxedMetalProduction + thisMexM
+								maxedBaseMetal = maxedBaseMetal + myMetalIncome
+								maxedOverdrive = maxedOverdrive + myMetalIncome * metalMult
+
+								allyMetalSquared = allyMetalSquared - myMetalIncome * myMetalIncome
+								gridMetalGain[i] = gridMetalGain[i] + myMetalIncome * metalMult
+
+								if mexByID[unitID_inner].refundTeams then
+									mexBaseMetal[unitID_inner] = myMetalIncome
+								end
+							end
+							break --finish distributing energy to 1 grid, go to next grid
+						end
+					end
+
+					local metalMult = energyToExtraM(mexE)
+					local thisMexM = myMetalIncome + myMetalIncome * metalMult
+
+					spSetUnitRulesParam(unitID, "overdrive", 1 + mexE / 5, inlosTrueTable)
+					spSetUnitRulesParam(unitID, "overdrive_energyDrain", mexE, inlosTrueTable)
+					spSetUnitRulesParam(unitID, "current_metalIncome", thisMexM, inlosTrueTable)
+					spSetUnitRulesParam(unitID, "overdrive_proportion", metalMult, inlosTrueTable)
+
+					summedMetalProduction = summedMetalProduction + thisMexM
+					summedBaseMetal = summedBaseMetal + myMetalIncome
+					summedOverdrive = summedOverdrive + myMetalIncome * metalMult
+
+					gridMetalGain[i] = gridMetalGain[i] + myMetalIncome * metalMult
+
+					if mexByID[unitID].refundTeams then
+						mexBaseMetal[unitID] = myMetalIncome
+					end
+				end
+
+				if reCalc then
+					break
+				end
+			end
+		end
+	end
+
+	for unitID, baseMetal in pairs(mexBaseMetal) do
+		local toRefund = mexByID[unitID].refundTeams
+		local private_share = UpdateAndGetCurrentMexRefundShare(unitID, baseMetal) 
+		
+		if private_share then
+			for teamID, prop in pairs(toRefund) do
+				privateBaseMetal[teamID] = (privateBaseMetal[teamID] or 0) + private_share * prop
+				teamPayback[teamID].metalDueBase = teamPayback[teamID].metalDueBase - private_share * prop
+			end
+		end
+	end
+
+	if energyWasted < 0.01 then
+		energyWasted = 0
+	end
+
+	return energyWasted,
+		summedMetalProduction + maxedMetalProduction,
+		summedBaseMetal + maxedBaseMetal,
+		summedOverdrive + maxedOverdrive,
+		gridEnergySpent,
+		gridMetalGain,
+		privateBaseMetal
+end
+
+local function teamEcho(team, st)
+	if team == 0 then
+		Spring.Echo(st)
+	end
+end
+
+local lastTeamOverdriveNetLoss = {}
+
+function gadget:GameFrame(n)
+	
+	if not (GG.Lagmonitor and GG.Lagmonitor.GetResourceShares) then
+		Spring.Log(gadget:GetInfo().name, LOG.ERROR, "Lag monitor doesn't work so Overdrive is STUFFED")
+	end
+	local allyTeamResourceShares, teamResourceShare = GG.Lagmonitor.GetResourceShares()
+	
+	if (n % TEAM_SLOWUPDATE_RATE == 1) then
+		for allyTeamID, allyTeamData in pairs(allyTeamInfo) do
+			local debugMode = debugAllyTeam and debugAllyTeam[allyTeamID]
+			--// Check if pylons changed their active status (emp, reverse-build, ..)
+			local list = pylonList[allyTeamID]
+			for i = 1, list.count do
+				local unitID = list.data[i]
+				local pylonData = pylon[allyTeamID][unitID]
+				if pylonData then
+					if spValidUnitID(unitID) then
+						local stunned_or_inbuld = spGetUnitIsStunned(unitID) or
+							(spGetUnitRulesParam(unitID,"disarmed") == 1) or
+							(spGetUnitRulesParam(unitID,"morphDisable") == 1)
+						local activeState = Spring.Utilities.GetUnitActiveState(unitID)
+						local currentlyActive = (not stunned_or_inbuld) and (activeState or pylonData.neededLink)
+						if (currentlyActive) and (not pylonData.active) then
+							ReactivatePylon(unitID)
+						elseif (not currentlyActive) and (pylonData.active) then
+							DeactivatePylon(unitID)
+						end
+					end
+				elseif not spammedError then
+					Spring.Echo("Pylon problem detected in status check.")
+				end
+			end
+
+			AddPylonsInQueueToGrid()
+			
+			--// Calculate personal and shared energy income, and shared constructor metal income.
+			-- Income is only from energy structures and constructors. Reclaim is always personal and unhandled by OD.
+			local resourceShares = allyTeamResourceShares[allyTeamID]
+			local splitByShare = true
+			if (not resourceShares) or resourceShares < 1 then
+				splitByShare = false
+				resourceShares = allyTeamData.teams
+			end
+			
+			local allyTeamMiscMetalIncome = allyTeamData.innateMetal
+			local allyTeamSharedEnergyIncome = allyTeamData.innateEnergy
+			local teamEnergy = {}
+			
+			for j = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[j]
+				-- Calculate total energy and misc. metal income from units and structures
+				local genList = generatorList[allyTeamID][teamID]
+				local gen = generator[allyTeamID][teamID]
+				local sumEnergy = 0
+				for i = 1, genList.count do
+					local unitID = genList.data[i]
+					local data = gen[unitID]
+					if spValidUnitID(unitID) then
+						if spGetUnitRulesParam(unitID, "isWind") then
+							local energy = spGetUnitRulesParam(unitID,"current_energyIncome") or 0
+							sumEnergy = sumEnergy + energy
+						else
+							local stunned_or_inbuld = spGetUnitIsStunned(unitID)
+							local currentlyActive = not stunned_or_inbuld
+							local metal, energy = 0, 0
+							if currentlyActive then
+								local incomeFactor = spGetUnitRulesParam(unitID,"resourceGenerationFactor") or 1
+								metal  = data.metalIncome*incomeFactor
+								energy = data.energyIncome*incomeFactor
+
+								allyTeamMiscMetalIncome = allyTeamMiscMetalIncome + metal
+								if data.sharedEnergyGenerator then
+									allyTeamSharedEnergyIncome = allyTeamSharedEnergyIncome + energy
+								else
+									sumEnergy = sumEnergy + energy
+								end
+							end
+							spSetUnitRulesParam(unitID, "current_metalIncome", metal, inlosTrueTable)
+							spSetUnitRulesParam(unitID, "current_energyIncome", energy, inlosTrueTable)
+						end
+					end
+				end
+				
+				teamEnergy[teamID] = {inc = sumEnergy}
+			end
+			
+			if debugMode then
+				Spring.Echo("=============== Overdrive Debug " .. allyTeamID .. " ===============")
+				Spring.Echo("resourceShares", resourceShares, "teams", allyTeamData.teams, "metal", allyTeamMiscMetalIncome, "energy", allyTeamSharedEnergyIncome)
+				Spring.Echo("splitByShare", splitByShare, "innate metal", allyTeamData.innateMetal, "innate energy", allyTeamData.innateEnergy)
+			end
+			
+			--// Calculate total energy and other metal income from structures and units
+			-- Does not include reclaim
+
+			local allyTeamEnergyIncome = 0
+			local allyTeamExpense = 0
+			local allyTeamEnergySpare = 0
+			local allyTeamPositiveSpare = 0
+			local allyTeamNegativeSpare = 0
+			local allyTeamEnergyCurrent = 0
+			local allyTeamEnergyMax = 0
+			local allyTeamEnergyMaxCurMax = 0
+			local holdBackEnergyFromOverdrive = 0
+
+			local energyProducerOrUserCount = 0
+			local sumInc = 0
+			for i = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[i]
+				-- Collect energy information and contribute to ally team data.
+				local te = teamEnergy[teamID]
+				
+				local share = (splitByShare and teamResourceShare[teamID]) or 1
+				te.inc = te.inc + share*allyTeamSharedEnergyIncome/resourceShares
+
+				te.cur, te.max, te.pull, _, te.exp, _, te.sent, te.rec = spGetTeamResources(teamID, "energy")
+				te.exp = math.max(0, te.exp - (lastTeamOverdriveNetLoss[teamID] or 0))
+
+				te.max = math.max(MIN_STORAGE, te.max - HIDDEN_STORAGE) -- Caretakers spend in chunks of 0.33
+
+				allyTeamEnergyIncome = allyTeamEnergyIncome + te.inc
+				allyTeamEnergyCurrent = allyTeamEnergyCurrent + te.cur
+				allyTeamEnergyMax = allyTeamEnergyMax + te.max
+				allyTeamExpense = allyTeamExpense + te.exp
+
+				te.spare = te.inc - te.exp
+				if te.max == MIN_STORAGE and te.spare < MIN_STORAGE then
+					te.spare = 0
+				end
+
+				allyTeamEnergySpare = allyTeamEnergySpare + te.spare
+				allyTeamPositiveSpare = allyTeamPositiveSpare + max(0, te.spare)
+				allyTeamNegativeSpare = allyTeamNegativeSpare + max(0, -te.spare)
+				
+				if debugMode then
+					Spring.Echo("--- Team Economy ---", teamID, "has share", teamResourceShare[teamID])
+					Spring.Echo("inc", te.inc, "exp", te.exp, "spare", te.spare, "pull", te.pull)
+					Spring.Echo("last spend", lastTeamOverdriveNetLoss[teamID], "cur", te.cur, "max", te.max)
+				end
+				
+				if te.inc > 0 or te.exp > 0 then
+					-- Include expense in case someone has no economy at all (not even cons) and wants to run cloak.
+					te.energyProducerOrUser = true
+					energyProducerOrUserCount = energyProducerOrUserCount + 1
+				end
+			end
+			
+			if energyProducerOrUserCount == 0 then
+				for i = 1, allyTeamData.teams do
+					local teamID = allyTeamData.team[i]
+					local te = teamEnergy[teamID]
+					te.energyProducerOrUser = true
+				end
+				energyProducerOrUserCount = allyTeamData.teams
+				if energyProducerOrUserCount == 0 then
+					energyProducerOrUserCount = 1
+				end
+			end
+			
+			-- Allocate extra energy storage to teams with less energy income than the spare energy of their team.
+			-- This better allows teams to spend at the capacity supported by their team.
+			local averageSpare = allyTeamEnergySpare/energyProducerOrUserCount
+			if debugMode then
+				Spring.Echo("=========== Spare Energy ===========", allyTeamID)
+				Spring.Echo("averageSpare", averageSpare)
+			end
+			for i = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[i]
+				local te = teamEnergy[teamID]
+				if te.energyProducerOrUser then
+					te.extraFreeStorage = math.max(0, averageSpare - te.inc)
+					
+					-- This prevents full overdrive until everyone has full energy storage.
+					allyTeamEnergyMaxCurMax = allyTeamEnergyMaxCurMax + math.max(te.max + te.extraFreeStorage, te.cur)
+					
+					-- Save from energy from being sent to overdrive if we are stalling and have below average energy income.
+					local holdBack = math.max(0, te.extraFreeStorage - te.cur)
+					holdBackEnergyFromOverdrive = holdBackEnergyFromOverdrive + holdBack
+					if debugMode then
+						Spring.Echo(teamID, "extraFreeStorage", te.extraFreeStorage, "spare", te.spare, "held back", holdBack)
+					end
+				else
+					te.extraFreeStorage = 0
+					if debugMode then
+						Spring.Echo(teamID, "Not participating")
+					end
+				end
+			end
+			
+			-- This is how much energy will be spent on overdrive. It remains to determine how much
+			-- is spent by each player.
+			local energyForOverdrive = max(0, allyTeamEnergySpare)*((allyTeamEnergyMaxCurMax > 0 and max(0, min(1, allyTeamEnergyCurrent/allyTeamEnergyMaxCurMax))) or 1)
+			energyForOverdrive = math.max(0, energyForOverdrive - holdBackEnergyFromOverdrive)
+			
+			if debugMode then
+				Spring.Echo("=========== AllyTeam Economy ===========", allyTeamID)
+				Spring.Echo("inc", allyTeamEnergyIncome, "exp", allyTeamExpense, "spare", allyTeamEnergySpare)
+				Spring.Echo("+spare", allyTeamPositiveSpare, "-spare", allyTeamNegativeSpare, "cur", allyTeamEnergyCurrent, "max", allyTeamEnergyMax)
+				Spring.Echo("energyForOverdrive", energyForOverdrive, "heldBack", holdBackEnergyFromOverdrive)
+				Spring.Echo("maxCurMax", allyTeamEnergyMaxCurMax, "averageSpare", averageSpare)
+			end
+			
+			-- The following inequality holds:
+			-- energyForOverdrive <= allyTeamEnergySpare <= allyTeamPositiveSpare
+			-- which means the redistribution is guaranteed to work
+
+			--// Spend energy on overdrive and redistribute energy to stallers.
+			for i = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[i]
+				local te = teamEnergy[teamID]
+				if te.spare > 0 then
+					-- Teams with spare energy spend their energy proportional to how much is needed for overdrive.
+					te.overdriveEnergyNet = -te.spare*energyForOverdrive/allyTeamPositiveSpare
+					-- Note that this value is negative
+				else
+					te.overdriveEnergyNet = 0
+				end
+			end
+
+			-- Check for consistency.
+			--local totalNet = 0
+			--for i = 1, allyTeamData.teams do
+			--	local teamID = allyTeamData.team[i]
+			--	local te = teamEnergy[teamID]
+			--	totalNet = totalNet + te.overdriveEnergyNet
+			--end
+			--teamEcho(allyTeamID, totalNet .. "   " .. energyForOverdrive)
+
+			--// Calculate Per-Grid Energy
+			local maxGridCapacity = {}
+			for i = 1, allyTeamData.grids do
+				maxGridCapacity[i] = 0
+				if not allyTeamData.nilGrid[i] then
+					for unitID,_ in pairs(allyTeamData.grid[i].pylon) do
+						local stunned_or_inbuild = spGetUnitIsStunned(unitID) or (spGetUnitRulesParam(unitID,"disarmed") == 1) or (spGetUnitRulesParam(unitID,"morphDisable") == 1)
+						if (not stunned_or_inbuild) then
+							local income = spGetUnitRulesParam(unitID, "current_energyIncome") or 0
+							maxGridCapacity[i] = maxGridCapacity[i] + income
+						end
+					end
+				end
+			end
+
+			--// check if pylons disable due to low grid power (eg weapons)
+			for i = 1, list.count do
+				local unitID = list.data[i]
+				local pylonData = pylon[allyTeamID][unitID]
+				if pylonData then
+					if pylonData.neededLink then
+						if (pylonData.gridID == 0 or pylonData.neededLink > maxGridCapacity[pylonData.gridID]) and not waiveGridLowPower then
+							spSetUnitRulesParam(unitID, "lowpower", 1, inlosTrueTable)
+							GG.ScriptNotifyUnpowered(unitID, true)
+						else
+							spSetUnitRulesParam(unitID, "lowpower", 0, inlosTrueTable)
+							GG.ScriptNotifyUnpowered(unitID, false)
+						end
+					end
+				elseif not spammedError then
+					Spring.Echo("Pylon problem detected in low power check.")
+				end
+			end
+
+			--// Use the free Grid-Energy for Overdrive
+			local energyWasted, summedMetalProduction, summedBaseMetal, summedOverdrive,
+				gridEnergySpent, gridMetalGain, privateBaseMetal =
+					OptimizeOverDrive(allyTeamID,allyTeamData,energyForOverdrive,maxGridCapacity)
+
+			local overdriveEnergySpending = energyForOverdrive - energyWasted
+			--// Refund excess energy from overdrive and overfull storages.
+			local totalFreeStorage = 0
+			local totalFreeStorageLimited = 0
+			local energyToRefund = energyWasted
+			for i = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[i]
+				local te = teamEnergy[teamID]
+				-- Storage capacing + eexpected spending is the maximun allowed storage.
+				
+				-- Allow a refund up to the to the average spare energy contributed to the system. This allows
+				-- people with zero storage to build.
+				te.freeStorage = te.max + te.exp - te.cur + te.extraFreeStorage
+				if te.energyProducerOrUser then
+					te.freeStorage = te.freeStorage + allyTeamEnergySpare/energyProducerOrUserCount
+				end
+				if te.freeStorage > 0 then
+					if te.energyProducerOrUser then
+						totalFreeStorage = totalFreeStorage + te.freeStorage
+						totalFreeStorageLimited = totalFreeStorageLimited + min(FREE_STORAGE_LIMIT, te.freeStorage)
+						if debugMode then
+							Spring.Echo(teamID, "Free", te.freeStorage)
+						end
+					end
+				else
+					-- Even sides that do not produce or consume may have excess energy.
+					energyToRefund = energyToRefund - te.freeStorage
+					te.overdriveEnergyNet = te.overdriveEnergyNet + te.freeStorage
+					te.freeStorage = 0
+					if debugMode then
+						Spring.Echo(teamID, "Overflow", -te.freeStorage)
+					end
+				end
+			end
+			
+			if debugMode then
+				Spring.Echo("AllyTeam totalFreeStorage", totalFreeStorage, "energyToRefund", energyToRefund)
+			end
+
+			if totalFreeStorageLimited > energyToRefund then
+				for i = 1, allyTeamData.teams do
+					local teamID = allyTeamData.team[i]
+					local te = teamEnergy[teamID]
+					if te.energyProducerOrUser then
+						te.overdriveEnergyNet = te.overdriveEnergyNet + energyToRefund*min(FREE_STORAGE_LIMIT, te.freeStorage)/totalFreeStorageLimited
+					end
+				end
+				energyWasted = 0
+			elseif totalFreeStorage > energyToRefund then
+				energyToRefund = energyToRefund - totalFreeStorageLimited -- Give everyone energy up to the free storage limit.
+				totalFreeStorage = totalFreeStorage - totalFreeStorageLimited
+				for i = 1, allyTeamData.teams do
+					local teamID = allyTeamData.team[i]
+					local te = teamEnergy[teamID]
+					if te.energyProducerOrUser then
+						if te.freeStorage > FREE_STORAGE_LIMIT then
+							te.overdriveEnergyNet = te.overdriveEnergyNet + FREE_STORAGE_LIMIT + energyToRefund*(te.freeStorage - FREE_STORAGE_LIMIT)/totalFreeStorage
+						else
+							te.overdriveEnergyNet = te.overdriveEnergyNet + te.freeStorage
+						end
+					end
+				end
+				energyWasted = 0
+			else
+				for i = 1, allyTeamData.teams do
+					local teamID = allyTeamData.team[i]
+					local te = teamEnergy[teamID]
+					if te.energyProducerOrUser then
+						te.overdriveEnergyNet = te.overdriveEnergyNet + te.freeStorage
+					end
+				end
+				energyWasted = energyToRefund - totalFreeStorage
+			end
+			
+			if debugMode then
+				Spring.Echo("AllyTeam energyWasted", energyWasted)
+			end
+
+			--// Income For non-Gridded mexes
+			for unitID, orgMetal in pairs(mexes[allyTeamID][0]) do
+				local stunned_or_inbuld = spGetUnitIsStunned(unitID) or (spGetUnitRulesParam(unitID,"disarmed") == 1)
+				if stunned_or_inbuld then
+					orgMetal = 0
+				end
+				summedBaseMetal = summedBaseMetal + orgMetal
+
+				spSetUnitRulesParam(unitID, "overdrive", 1, inlosTrueTable)
+				spSetUnitRulesParam(unitID, "overdrive_energyDrain", 0, inlosTrueTable)
+				spSetUnitRulesParam(unitID, "current_metalIncome", orgMetal, inlosTrueTable)
+				spSetUnitRulesParam(unitID, "overdrive_proportion", 0, inlosTrueTable)
+
+				if mexByID[unitID].refundTeams then
+					local toRefund = mexByID[unitID].refundTeams
+					local private_share = UpdateAndGetCurrentMexRefundShare(unitID, orgMetal) 
+					
+					if private_share then
+						for teamID, prop in pairs(toRefund) do
+							privateBaseMetal[teamID] = (privateBaseMetal[teamID] or 0) + private_share * prop
+							teamPayback[teamID].metalDueBase = teamPayback[teamID].metalDueBase - private_share * prop
+						end
+					end
+				end
+
+				summedMetalProduction = summedMetalProduction + orgMetal
+			end
+
+			--// Update pylon tooltips
+			for i = 1, list.count do
+				local unitID = list.data[i]
+				local pylonData = pylon[allyTeamID][unitID]
+				if pylonData then
+					local grid = pylonData.gridID
+					local gridEfficiency = -1
+					if grid ~= 0 then
+						if gridMetalGain[grid] > 0 then
+							gridEfficiency = gridEnergySpent[grid]/gridMetalGain[grid]
+						else
+							gridEfficiency = 0
+						end
+					end
+
+					spSetUnitRulesParam(unitID, "gridefficiency", gridEfficiency, alliedTrueTable)
+
+					if not pylonData.mex then
+						local unitDefID = spGetUnitDefID(unitID)
+						if not unitDefID then
+							if not spammedError then
+								Spring.Log(gadget:GetInfo().name, LOG.ERROR, "unitDefID missing for pylon")
+								spammedError = true
+							end
+						else
+							if not pylonDefs[unitDefID].keeptooltip then
+								if grid ~= 0 then
+									spSetUnitRulesParam(unitID, "OD_gridCurrent", gridEnergySpent[grid], alliedTrueTable)
+									spSetUnitRulesParam(unitID, "OD_gridMaximum", maxGridCapacity[grid], alliedTrueTable)
+									spSetUnitRulesParam(unitID, "OD_gridMetal", gridMetalGain[grid], alliedTrueTable)
+								else
+									spSetUnitRulesParam(unitID, "OD_gridCurrent", -1, alliedTrueTable)
+								end
+							end
+						end
+					end
+				elseif not spammedError then
+					Spring.Echo("Pylon problem detected in tooltip update.")
+				end
+			end
+
+			-- Extra base share from mex production
+			local summedBaseMetalAfterPrivate = summedBaseMetal
+			for i = 1, allyTeamData.teams do  -- calculate active team OD sum
+				local teamID = allyTeamData.team[i]
+				if privateBaseMetal[teamID] then
+					summedBaseMetalAfterPrivate = summedBaseMetalAfterPrivate - privateBaseMetal[teamID]
+				end
+			end
+
+			--Spring.Echo(allyTeamID .. " energy sum " .. teamODEnergySum)
+			sendAllyTeamInformationToAwards(allyTeamID, summedBaseMetal, summedOverdrive, allyTeamEnergyIncome, ODenergy, energyWasted)
+
+			-- Payback from energy production
+			local summedOverdriveMetalAfterPayback = summedOverdrive
+			local teamPaybackOD = {}
+			if enableEnergyPayback then
+				for i = 1, allyTeamData.teams do
+					local teamID = allyTeamData.team[i]
+					if teamResourceShare[teamID] then -- Isn't this always 1 or 0?
+					-- well it can technically be 2+ when comsharing (but shouldn't act as a multiplier because the debt should transfer)
+						local te = teamEnergy[teamID]
+						teamPaybackOD[teamID] = 0
+
+						local paybackInfo = teamPayback[teamID]
+						if paybackInfo then
+							local data = paybackInfo.data
+							local toRemove = paybackInfo.toRemove
+							local j = 1
+							while j <= paybackInfo.count do
+								local unitID = data[j].unitID
+								local removeNow = toRemove[unitID]
+
+								if not removeNow then
+									if spValidUnitID(unitID) then
+										local inc = spGetUnitRulesParam(unitID, "current_energyIncome") or 0
+										if inc > 0 then
+											local repayRatio = data[j].repaid/data[j].cost
+											if repayRatio < 1 then
+												local repayMetal = inc/allyTeamEnergyIncome * summedOverdrive * paybackFactorFunction(repayRatio)
+												data[j].repaid = data[j].repaid + repayMetal
+												summedOverdriveMetalAfterPayback = summedOverdriveMetalAfterPayback - repayMetal
+												teamPaybackOD[teamID] = teamPaybackOD[teamID] + repayMetal
+												paybackInfo.metalDueOD = paybackInfo.metalDueOD - repayMetal
+												--Spring.Echo("Repaid " .. data[j].repaid)
+											else
+												removeNow = true
+											end
+										end
+									else
+										-- This should never happen in theory
+										removeNow = true
+									end
+								end
+
+								if removeNow then
+									paybackInfo.metalDueOD = paybackInfo.metalDueOD + data[j].repaid - data[j].cost
+									data[j] = data[paybackInfo.count]
+									if toRemove[unitID] then
+										toRemove[unitID] = nil
+									end
+									data[paybackInfo.count] = nil
+									paybackInfo.count = paybackInfo.count - 1
+								else
+									j = j + 1
+								end
+							end
+						end
+					end
+				end
+			end
+			
+			--// Share Overdrive Metal and Energy
+			-- Make changes to team resources
+			local shareToSend = {}
+			local metalStorageToSet = {}
+			local totalToShare = 0
+			local freeSpace = {}
+			local totalFreeSpace = 0
+			local totalMetalIncome = {}
+			for i = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[i]
+				local te = teamEnergy[teamID]
+
+				--// Energy
+				-- Inactive teams still interact normally with energy for a few reasons:
+				-- * Energy shared to them would disappear otherwise.
+				-- * If they have reclaim (somehow) then they could build up storage without sharing.
+				local energyChange = te.overdriveEnergyNet + te.inc
+				if energyChange > 0 then
+					spAddTeamResource(teamID, "e", energyChange)
+					lastTeamOverdriveNetLoss[teamID] = 0
+				elseif te.overdriveEnergyNet + te.inc < 0 then
+					spUseTeamResource(teamID, "e", -energyChange)
+					lastTeamOverdriveNetLoss[teamID] = -energyChange
+				else
+					lastTeamOverdriveNetLoss[teamID] = 0
+				end
+				
+				if debugMode then
+					Spring.Echo("Team energy income", teamID, "change", energyChange, "inc", te.inc, "net", te.overdriveEnergyNet)
+				end
+				
+				-- Metal
+				local odShare = 0
+				local baseShare = 0
+				local miscShare = 0
+				local energyMisc = 0
+
+				local share = (splitByShare and teamResourceShare[teamID]) or 1
+				if share > 0 then
+					odShare = ((share * summedOverdriveMetalAfterPayback / resourceShares) + (teamPaybackOD[teamID] or 0)) or 0
+					baseShare = ((share * summedBaseMetalAfterPrivate / resourceShares) + (privateBaseMetal[teamID] or 0)) or 0
+					miscShare = share * allyTeamMiscMetalIncome / resourceShares
+					energyMisc = share * allyTeamSharedEnergyIncome / resourceShares
+				else
+					odShare = (teamPaybackOD[teamID] or 0)
+					baseShare = (privateBaseMetal[teamID] or 0)
+				end
+
+				sendTeamInformationToAwards(teamID, baseShare, odShare, te.overdriveEnergyNet)
+
+				local mCurr, mStor = spGetTeamResources(teamID, "metal")
+				mStor = math.max(MIN_STORAGE, mStor - HIDDEN_STORAGE) -- Caretakers spend in chunks of 0.33
+				
+				if mCurr > mStor then
+					shareToSend[i] = mCurr - mStor
+					metalStorageToSet[i] = mStor
+					totalToShare = totalToShare + shareToSend[i]
+				end
+				
+				local metalIncome = odShare + baseShare + miscShare
+				if mCurr + metalIncome < mStor then
+					freeSpace[i] = mStor - (mCurr + metalIncome)
+				end
+				
+				totalMetalIncome[i] = metalIncome
+				--Spring.Echo(teamID .. " got odShare " .. odShare)
+				SetTeamEconomyRulesParams(
+					teamID, resourceShares, -- TeamID of the team as well as number of active allies.
+
+					summedBaseMetal, -- AllyTeam base metal extrator income
+					summedOverdrive, -- AllyTeam overdrive income
+					allyTeamMiscMetalIncome, -- AllyTeam constructor income
+
+					allyTeamEnergyIncome, -- AllyTeam total energy income (everything)
+					allyTeamSharedEnergyIncome,
+					overdriveEnergySpending, -- AllyTeam energy spent on overdrive
+					energyWasted, -- AllyTeam energy excess
+
+					baseShare, -- Team share of base metal extractor income
+					odShare, -- Team share of overdrive income
+					miscShare, -- Team share of constructor metal income
+
+					te.inc, -- Non-reclaim energy income for the team
+					energyMisc, -- Team share of innate and constructor income
+					te.overdriveEnergyNet, -- Amount of energy spent or recieved due to overdrive and income
+					te.overdriveEnergyNet + te.inc -- real change in energy due to overdrive
+				)
+			end
+			
+			for i = 1, allyTeamData.teams do
+				local share = (splitByShare and teamResourceShare[teamID]) or 1
+				if freeSpace[i] then
+					freeSpace[i] = min(freeSpace[i], totalToShare * share)
+					totalFreeSpace = totalFreeSpace + freeSpace[i]
+				end
+			end
+			
+			if totalToShare ~= 0 then
+				local excessFactor = 1 - min(1, totalFreeSpace/totalToShare)
+				local shareFactorPerSpace = (1 - excessFactor)/totalFreeSpace
+				for i = 1, allyTeamData.teams do
+					if shareToSend[i] then
+						local sendID = allyTeamData.team[i]
+							
+						for j = 1, allyTeamData.teams do
+							if freeSpace[j] then
+								local recieveID = allyTeamData.team[j]
+								Spring.ShareTeamResource(sendID, recieveID, "metal", shareToSend[i] * freeSpace[j] * shareFactorPerSpace)
+							end
+						end
+						if excessFactor ~= 0 and GG.EndgameGraphs then
+							GG.EndgameGraphs.AddTeamMetalExcess(sendID, shareToSend[i] * excessFactor)
+						end
+					end
+				end
+			end
+			
+			for i = 1, allyTeamData.teams do
+				local teamID = allyTeamData.team[i]
+				if metalStorageToSet[i] then
+					spSetTeamResource(teamID, "metal", metalStorageToSet[i])
+				end
+				spAddTeamResource(teamID, "m", totalMetalIncome[i])
+			end
+		end
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- MEXES
+
+local function AddMex(unitID, teamID, metalMake)
+	if (metalMake or 0) <= 0 then
+		return
+	end
+	local allyTeamID = spGetUnitAllyTeam(unitID)
+	if (allyTeamID) then
+		mexByID[unitID] = {gridID = 0, allyTeamID = allyTeamID}
+
+		spSetUnitRulesParam(unitID, "current_metalIncome", metalMake, inlosTrueTable)
+		local mexGridID = 0
+		local pylonData = pylon[allyTeamID][unitID]
+		if pylonData then
+			pylonData.mex = true --in case some magical case where pylon was initialized as not mex, then became mex?
+			mexGridID = pylonData.gridID
+		end
+		mexes[allyTeamID][mexGridID][unitID] = metalMake
+		mexByID[unitID].gridID = mexGridID
+	end
+end
+
+local function RemoveMex(unitID)
+	local gridID = 0
+	local mex = mexByID[unitID]
+
+	if mex and mexes[mex.allyTeamID][mex.gridID][unitID] then
+
+		local orgMetal = mexes[mex.allyTeamID][mex.gridID][unitID]
+		local ai = allyTeamInfo[mex.allyTeamID]
+		local g = ai.grid[mex.gridID]
+
+		local pylonData = pylon[mex.allyTeamID][unitID]
+		if pylonData then
+			pylonData.mex = nil --for some magical case where mex is to be removed but the pylon not?
+		end
+		mexes[mex.allyTeamID][mex.gridID][unitID] = nil
+
+		local toRefund = mexByID[unitID].refundTeams
+		if toRefund then
+			for teamID, prop in pairs(toRefund) do
+				teamPayback[teamID].metalDueBase = teamPayback[teamID].metalDueBase - (mexByID[unitID].refundTotal - mexByID[unitID].refundSoFar) * prop
+			end
+		end
+		mexByID[unitID] = nil
+	else
+		local x,_,z = spGetUnitPosition(unitID)
+		Spring.MarkerAddPoint(x,0,z,"inconsistent mex entry 124125_1")
+	end
+
+	for allyTeam, _ in pairs(mexes) do
+		for i = 0, allyTeamInfo[allyTeam].grids do
+			if (mexes[allyTeam][i][unitID] ~= nil) then
+				local x,_,z = spGetUnitPosition(unitID)
+				Spring.MarkerAddPoint(x,0,z,"inconsistent mex entry 124125_0")
+			end
+		end
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- RESOURCE GENERATORS
+
+local function AddResourceGenerator(unitID, unitDefID, teamID, allyTeamID)
+	allyTeamID = allyTeamID or spGetUnitAllyTeam(unitID)
+	teamID = teamID or spGetUnitTeam(unitID)
+
+	--if generator[allyTeamID][teamID][unitID] then
+		--return
+	--end
+
+	if unitDefID and generatorDefs[unitDefID] then
+		local defData = generatorDefs[unitDefID]
+		if spGetUnitRulesParam(unitID, "isWind") then
+			generator[allyTeamID][teamID][unitID] = {
+				isWind = defData.isWind,
+				sharedEnergyGenerator = defData.sharedEnergyGenerator,
+			}
+		else
+			generator[allyTeamID][teamID][unitID] = {
+				metalIncome = spGetUnitRulesParam(unitID, "wanted_metalIncome") or defData.metalIncome,
+				energyIncome = spGetUnitRulesParam(unitID, "wanted_energyIncome") or defData.energyIncome,
+				sharedEnergyGenerator = defData.sharedEnergyGenerator,
+			}
+		end
+	else
+		generator[allyTeamID][teamID][unitID] = {
+			metalIncome = spGetUnitRulesParam(unitID, "wanted_metalIncome") or 0,
+			energyIncome = spGetUnitRulesParam(unitID, "wanted_energyIncome") or 0,
+			sharedEnergyGenerator = unitDefID and UnitDefs[unitDefID].customParams.shared_energy_gen and true,
+		}
+	end
+
+	local list = generatorList[allyTeamID][teamID]
+	list.count = list.count + 1
+	list.data[list.count] = unitID
+
+	generator[allyTeamID][teamID][unitID].listID = list.count
+	resourceGeneratingUnit[unitID] = true
+end
+
+local function RemoveResourceGenerator(unitID, unitDefID, teamID, allyTeamID)
+	allyTeamID = allyTeamID or spGetUnitAllyTeam(unitID)
+	teamID = teamID or spGetUnitTeam(unitID)
+
+	resourceGeneratingUnit[unitID] = false
+
+	--if not generator[allyTeamID][teamID][unitID] then
+		--return
+	--end
+
+	local list = generatorList[allyTeamID][teamID]
+	local listID = generator[allyTeamID][teamID][unitID].listID
+	list.data[listID] = list.data[list.count]
+	generator[allyTeamID][teamID][list.data[listID]].listID = listID
+	list.data[list.count] = nil
+	list.count = list.count - 1
+	generator[allyTeamID][teamID][unitID] = nil
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+local function OverdriveDebugToggle()
+	if Spring.IsCheatingEnabled() then
+		debugGridMode = not debugGridMode
+		if debugGridMode then
+			local allyTeamList = Spring.GetAllyTeamList()
+			for i=1,#allyTeamList do
+				local allyTeamID = allyTeamList[i]
+				local list = pylonList[allyTeamID]
+				for j = 1, list.count do
+					local unitID = list.data[j]
+					Spring.Utilities.UnitEcho(unitID, j .. ", " .. unitID)
+				end
+			end
+		end
+	end
+end
+
+local function OverdriveDebugEconomyToggle(cmd, line, words, player)
+	if not Spring.IsCheatingEnabled() then
+		return
+	end
+	local allyTeamID = tonumber(words[1])
+	Spring.Echo("Debug priority for allyTeam " .. (allyTeamID or "nil"))
+	if allyTeamID then
+		if not debugAllyTeam then
+			debugAllyTeam = {}
+		end
+		if debugAllyTeam[allyTeamID] then
+			debugAllyTeam[allyTeamID] = nil
+			if #debugAllyTeam == 0 then
+				debugAllyTeam = {}
+			end
+			Spring.Echo("Disabled")
+		else
+			debugAllyTeam[allyTeamID] = true
+			Spring.Echo("Enabled")
+		end
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- External functions
+
+local externalFunctions = {}
+
+function externalFunctions.AddUnitResourceGeneration(unitID, metal, energy, sharedEnergyGenerator, override)
+	if not unitID then
+		return
+	end
+	local teamID = Spring.GetUnitTeam(unitID)
+	local allyTeamID = Spring.GetUnitAllyTeam(unitID)
+
+	if not teamID or not generator[allyTeamID] or not generator[allyTeamID][teamID] then
+		return
+	end
+
+	if not generator[allyTeamID][teamID][unitID] then
+		AddResourceGenerator(unitID, unitDefID, teamID, allyTeamID)
+	end
+
+	local genData = generator[allyTeamID][teamID][unitID]
+
+	local metalIncome = math.max(0, ((override and 0) or genData.metalIncome) + (metal * (Spring.GetModOptions().metalmult or 1)))
+	local energyIncome = math.max(0, ((override and 0) or genData.energyIncome) + (energy * (Spring.GetModOptions().energymult or 1)))
+
+	genData.metalIncome = metalIncome
+	genData.energyIncome = energyIncome
+	genData.sharedEnergyGenerator = sharedEnergyGenerator
+
+	spSetUnitRulesParam(unitID, "wanted_metalIncome", metalIncome, inlosTrueTable)
+	spSetUnitRulesParam(unitID, "wanted_energyIncome", energyIncome, inlosTrueTable)
+end
+
+function externalFunctions.AddInnateIncome(allyTeamID, metal, energy)
+	if not (allyTeamID and allyTeamInfo[allyTeamID]) then
+		return
+	end
+	if GG.allyTeamIncomeMult then
+		metal = metal * GG.allyTeamIncomeMult[allyTeamID]
+		energy = energy * GG.allyTeamIncomeMult[allyTeamID]
+	end
+	allyTeamInfo[allyTeamID].innateMetal = (allyTeamInfo[allyTeamID].innateMetal or 0) + metal
+	allyTeamInfo[allyTeamID].innateEnergy = (allyTeamInfo[allyTeamID].innateEnergy or 0) + energy
+	Spring.SetGameRulesParam("OD_allyteam_metal_innate_" .. allyTeamID, allyTeamInfo[allyTeamID].innateMetal)
+	Spring.SetGameRulesParam("OD_allyteam_energy_innate_" .. allyTeamID, allyTeamInfo[allyTeamID].innateEnergy)
+end
+
+function externalFunctions.RedirectTeamIncome(giveTeamID, recieveTeamID)
+
+end
+
+function externalFunctions.RemoveTeamIncomeRedirect(teamID)
+
+end
+
+function externalFunctions.SetNoGridRequirement(enabled)
+	waiveGridLowPower = enabled
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-- Payback share calculation
+
+function gadget:AllowUnitBuildStep(builderID, teamID, unitID, unitDefID, step)
+	if not allowBuildStepDef[unitDefID] then
+		return true
+	end
+	if not builderID then
+		return true
+	end
+	local buildTeamID = Spring.GetUnitTeam(builderID)
+	if not buildTeamID then
+		return true
+	end
+	buildPropTracker[unitID] = buildPropTracker[unitID] or {}
+	buildPropTracker[unitID][buildTeamID] = (buildPropTracker[unitID][buildTeamID] or 0) + step
+	return true
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+function gadget:Initialize()
+	GG.Overdrive = externalFunctions
+
+	_G.pylon = pylon
+	for _, unitID in ipairs(Spring.GetAllUnits()) do
+		local unitDefID = spGetUnitDefID(unitID)
+		if (mexDefs[unitDefID]) then
+			local inc = spGetUnitRulesParam(unitID, "mexIncome")
+			AddMex(unitID, false, inc)
+		end
+		if (pylonDefs[unitDefID]) then
+			AddPylon(unitID, unitDefID, pylonDefs[unitDefID].range)
+		end
+		if (generatorDefs[unitDefID]) or spGetUnitRulesParam(unitID, "wanted_energyIncome") then
+			AddResourceGenerator(unitID, unitDefID)
+		end
+	end
+
+	local teamList = Spring.GetTeamList()
+	for i = 1, #teamList do
+		teamPayback[teamList[i]] = {
+			metalDueOD = 0,
+			metalDueBase = 0,
+			count = 0,
+			toRemove = {},
+			data = {},
+		}
+	end
+
+	gadgetHandler:AddChatAction("debuggrid", OverdriveDebugToggle, "Toggles grid debug mode for overdrive.")
+	gadgetHandler:AddChatAction("debugecon", OverdriveDebugEconomyToggle, "Toggles economy debug mode for overdrive.")
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+local function MoveOrTransferSetup(unitID, unitDefID)
+	if (mexDefs[unitDefID] and mexByID[unitID]) then
+		RemoveMex(unitID)
+	end
+
+	if pylonDefs[unitDefID] then
+		RemovePylon(unitID)
+	end
+
+	if paybackDefs[unitDefID] and enableEnergyPayback then
+		RemoveEnergyToPayback(unitID, unitDefID)
+	end
+end
+
+local function MoveOrTransferAftermath(unitID, unitDefID)
+	if (mexDefs[unitDefID]) then
+		local inc = spGetUnitRulesParam(unitID, "mexIncome")
+		AddMex(unitID, false, inc)
+	end
+
+	if pylonDefs[unitDefID] then
+		AddPylon(unitID, unitDefID, pylonDefs[unitDefID].range)
+		--Spring.Echo(spGetUnitAllyTeam(unitID) .. "  " .. newAllyTeam)
+	end
+end
+
+GG.Overdrive_MoveOrTransferSetup = MoveOrTransferSetup
+GG.Overdrive_MoveOrTransferAftermath = MoveOrTransferAftermath
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+function gadget:UnitCreated(unitID, unitDefID, unitTeam)
+	if (mexDefs[unitDefID]) then
+		local inc = spGetUnitRulesParam(unitID, "mexIncome")
+		AddMex(unitID, unitTeam, inc)
+	end
+	if pylonDefs[unitDefID] then
+		AddPylon(unitID, unitDefID, pylonDefs[unitDefID].range)
+	end
+	if (generatorDefs[unitDefID]) or spGetUnitRulesParam(unitID, "wanted_energyIncome") then
+		AddResourceGenerator(unitID, unitDefID, unitTeam)
+	end
+end
+
+function gadget:UnitFinished(unitID, unitDefID, unitTeam)
+	if paybackDefs[unitDefID] and enableEnergyPayback then
+		if unitAlreadyFinished[unitID] then
+			return
+		end
+		unitAlreadyFinished[unitID] = true
+		AddEnergyToPayback(unitID, unitDefID, GetUnitTeamBuildProp(unitID, unitTeam))
+	end
+	if mexDefs[unitDefID] and enableMexPayback then
+		if unitAlreadyFinished[unitID] then
+			return
+		end
+		unitAlreadyFinished[unitID] = true
+		local inc = spGetUnitRulesParam(unitID, "mexIncome")
+		AddMexPayback(unitID, unitDefID, GetUnitTeamBuildProp(unitID, unitTeam), inc)
+	end
+end
+
+function gadget:UnitGiven(unitID, unitDefID, teamID, oldTeamID)
+	local _,_,_,_,_,newAllyTeam = spGetTeamInfo(teamID, false)
+	local _,_,_,_,_,oldAllyTeam = spGetTeamInfo(oldTeamID, false)
+
+	if (newAllyTeam ~= oldAllyTeam) then
+		MoveOrTransferAftermath(unitID, unitDefID)
+	end
+
+	if (generatorDefs[unitDefID]) or spGetUnitRulesParam(unitID, "wanted_energyIncome") then
+		AddResourceGenerator(unitID, unitDefID, teamID, newAllyTeamID)
+	end
+end
+
+function gadget:UnitTaken(unitID, unitDefID, oldTeamID, teamID)
+	local _,_,_,_,_,newAllyTeam = spGetTeamInfo(teamID, false)
+	local _,_,_,_,_,oldAllyTeam = spGetTeamInfo(oldTeamID, false)
+
+	if (newAllyTeam ~= oldAllyTeam) then
+		MoveOrTransferSetup(unitID, unitDefID)
+	end
+
+	if generatorDefs[unitDefID] or resourceGeneratingUnit[unitID] then
+		RemoveResourceGenerator(unitID, unitDefID, oldTeamID, oldAllyTeamID)
+	end
+end
+
+function gadget:UnitDestroyed(unitID, unitDefID, unitTeam)
+	if (mexDefs[unitDefID] and mexByID[unitID]) then
+		unitAlreadyFinished[unitID] = nil
+		buildPropTracker[unitID] = nil
+		RemoveMex(unitID)
+	end
+	if (pylonDefs[unitDefID]) then
+		RemovePylon(unitID)
+	end
+	if paybackDefs[unitDefID] and enableEnergyPayback then
+		unitAlreadyFinished[unitID] = nil
+		buildPropTracker[unitID] = nil
+		RemoveEnergyToPayback(unitID, unitDefID)
+	end
+	if generatorDefs[unitDefID] or resourceGeneratingUnit[unitID] then
+		RemoveResourceGenerator(unitID, unitDefID, unitTeam)
+	end
+end
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
